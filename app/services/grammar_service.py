@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import ValidationError
 
@@ -18,6 +18,12 @@ from app.services.ai_router import (
     AIRouterError,
     AIRouterRequestError,
     ai_router,
+)
+from app.services.grammar_engine import grammar_engine
+from app.services.nlp_parser import (
+    NLPParserError,
+    NLPParserUnavailableError,
+    nlp_parser,
 )
 from app.services.quality_validator import (
     validate_bangla_text_quality,
@@ -177,6 +183,130 @@ class GrammarService:
 
         return WordAnalysisResponse.model_validate(data)
 
+    def _extract_deterministic_facts(
+        self, sentence: str
+    ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+        """Extract low-level parser facts and high-level grammar facts deterministically,
+        with graceful fallback if NLP parser or GrammarEngine is unavailable.
+        """
+        parser_facts: Optional[dict[str, Any]] = None
+        grammar_facts: Optional[dict[str, Any]] = None
+
+        try:
+            parser_facts = nlp_parser.parse(sentence)
+        except NLPParserUnavailableError as exc:
+            logger.warning(
+                "NLPParser unavailable, falling back to LLM-only sentence analysis: %s",
+                exc,
+            )
+            return None, None
+        except NLPParserError as exc:
+            logger.warning(
+                "NLPParser error on sentence '%s': %s. Continuing with LLM fallback.",
+                sentence[:50],
+                exc,
+            )
+            return None, None
+        except Exception as exc:
+            logger.error("Unexpected error in NLPParser on sentence: %s", exc)
+            return None, None
+
+        if parser_facts:
+            try:
+                grammar_facts = grammar_engine.analyze(parser_facts)
+            except Exception as exc:
+                logger.error(
+                    "Unexpected error in GrammarEngine on sentence '%s': %s",
+                    sentence[:50],
+                    exc,
+                )
+                grammar_facts = None
+
+        return parser_facts, grammar_facts
+
+    def _reconcile_sentence_analysis(
+        self,
+        response: SentenceAnalysisResponse,
+        parser_facts: Optional[dict[str, Any]],
+        grammar_facts: Optional[dict[str, Any]],
+    ) -> SentenceAnalysisResponse:
+        """Reconcile LLM-generated fields with authoritative deterministic facts.
+        Only overrides fields where deterministic facts are reliable and non-null.
+        """
+        if not parser_facts and not grammar_facts:
+            return response
+
+        updates: dict[str, Any] = {}
+
+        if parser_facts:
+            # 1. Subject
+            if parser_facts.get("subjects"):
+                updates["subject"] = parser_facts["subjects"]
+
+            # 2. Main verbs
+            if parser_facts.get("main_verbs"):
+                updates["main_verbs"] = parser_facts["main_verbs"]
+
+            # 3. Auxiliary verbs
+            if "auxiliary_verbs" in parser_facts:
+                updates["auxiliary_verbs"] = parser_facts["auxiliary_verbs"]
+
+            # 4. Objects: combine direct_objects + indirect_objects (EXCLUDE objects_of_prepositions)
+            direct_objs = parser_facts.get("direct_objects", [])
+            indirect_objs = parser_facts.get("indirect_objects", [])
+            combined_objs: list[str] = []
+            seen: set[str] = set()
+            for obj in direct_objs + indirect_objs:
+                if obj and obj not in seen:
+                    seen.add(obj)
+                    combined_objs.append(obj)
+            updates["objects"] = combined_objs
+
+            # 5. Prepositions
+            if "prepositions" in parser_facts:
+                updates["prepositions"] = parser_facts["prepositions"]
+
+            # 6. Determiners
+            if "determiners" in parser_facts:
+                updates["determiners"] = parser_facts["determiners"]
+
+            # 7. Nouns
+            if "nouns" in parser_facts:
+                updates["nouns"] = parser_facts["nouns"]
+
+            # 8. Pronouns
+            if "pronouns" in parser_facts:
+                updates["pronouns"] = parser_facts["pronouns"]
+
+            # 9. Adjectives
+            if "adjectives" in parser_facts:
+                updates["adjectives"] = parser_facts["adjectives"]
+
+            # 10. Adverbs
+            if "adverbs" in parser_facts:
+                updates["adverbs"] = parser_facts["adverbs"]
+
+            # 11. Conjunctions
+            if "conjunctions" in parser_facts:
+                updates["conjunctions"] = parser_facts["conjunctions"]
+
+        if grammar_facts:
+            # 12. Tense: override ONLY when grammar_facts["tense"] is non-null
+            if grammar_facts.get("tense"):
+                updates["tense"] = grammar_facts["tense"]
+
+            # 13. Voice: override ONLY when grammar_facts["voice"] is non-null
+            if grammar_facts.get("voice"):
+                updates["voice"] = grammar_facts["voice"]
+
+        if not updates:
+            return response
+
+        # Reconstruct updated model safely
+        updated_data = response.model_dump()
+        updated_data.update(updates)
+        return SentenceAnalysisResponse.model_validate(updated_data)
+
     async def analyze_word(self, word: str) -> WordAnalysisResponse:
         """Analyze an English word and return structured pedagogical grammar data."""
         cleaned_word = self._validate_word(word)
@@ -256,17 +386,30 @@ class GrammarService:
         return retry_data
 
     async def analyze_sentence(self, sentence: str) -> SentenceAnalysisResponse:
-        """Analyze an English sentence and return structured syntax and pedagogical explanations."""
+        """Analyze an English sentence and return structured syntax and pedagogical explanations
+        combining deterministic NLP/Grammar facts with LLM teaching explanations.
+        """
         cleaned_sentence = self._validate_sentence(sentence)
-        base_prompt = build_sentence_analysis_prompt(cleaned_sentence)
 
-        # Primary generation attempt
+        # 1. Deterministic NLP & Grammar facts extraction
+        parser_facts, grammar_facts = self._extract_deterministic_facts(
+            cleaned_sentence
+        )
+
+        # 2. Build structured prompt with deterministic facts
+        base_prompt = build_sentence_analysis_prompt(
+            cleaned_sentence,
+            parser_facts=parser_facts,
+            grammar_facts=grammar_facts,
+        )
+
+        # 3. Primary generation attempt
         try:
             result = await self.ai_router.generate_structured(
                 prompt=base_prompt,
                 response_model=SentenceAnalysisResponse,
             )
-            data = (
+            raw_data = (
                 result.data
                 if isinstance(result.data, SentenceAnalysisResponse)
                 else SentenceAnalysisResponse.model_validate(result.data)
@@ -280,7 +423,12 @@ class GrammarService:
                 "AI routing failed to complete sentence analysis."
             ) from exc
 
-        # Semantic & structural quality validation
+        # 4. Authoritative deterministic field reconciliation
+        data = self._reconcile_sentence_analysis(
+            raw_data, parser_facts, grammar_facts
+        )
+
+        # 5. Semantic & structural quality validation
         violations = validate_sentence_analysis_quality(data)
         if not violations:
             return data
@@ -293,7 +441,9 @@ class GrammarService:
         )
 
         script_violations = [v for v in violations if "forbidden foreign-script" in v]
-        structural_violations = [v for v in violations if "forbidden foreign-script" not in v]
+        structural_violations = [
+            v for v in violations if "forbidden foreign-script" not in v
+        ]
 
         reinforcement_sections: list[str] = []
 
@@ -326,7 +476,7 @@ class GrammarService:
                 prompt=retry_prompt,
                 response_model=SentenceAnalysisResponse,
             )
-            retry_data = (
+            raw_retry_data = (
                 retry_result.data
                 if isinstance(retry_result.data, SentenceAnalysisResponse)
                 else SentenceAnalysisResponse.model_validate(retry_result.data)
@@ -339,6 +489,11 @@ class GrammarService:
             raise GrammarResponseValidationError(
                 "Regeneration after semantic quality check failure was unsuccessful."
             ) from exc
+
+        # Reconcile regenerated response
+        retry_data = self._reconcile_sentence_analysis(
+            raw_retry_data, parser_facts, grammar_facts
+        )
 
         retry_violations = validate_sentence_analysis_quality(retry_data)
         if retry_violations:
@@ -378,4 +533,5 @@ class GrammarService:
 
 
 grammar_service = GrammarService()
+
 

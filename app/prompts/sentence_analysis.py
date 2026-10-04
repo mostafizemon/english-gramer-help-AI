@@ -1,14 +1,112 @@
-def build_sentence_analysis_prompt(sentence: str) -> str:
+import json
+from typing import Any, Optional
+
+
+def _format_deterministic_context(
+    parser_facts: Optional[dict[str, Any]] = None,
+    grammar_facts: Optional[dict[str, Any]] = None,
+) -> str:
+    """Format low-level parser and high-level grammar engine facts into a clean,
+    compact prompt section for LLM guidance.
+    """
+    if not parser_facts and not grammar_facts:
+        return ""
+
+    facts_lines: list[str] = [
+        "=============================================================================",
+        "AUTHORITATIVE DETERMINISTIC GRAMMAR FACTS",
+        "=============================================================================",
+        "These facts were extracted deterministically by the local NLP & Grammar Engine.",
+        "Treat non-null deterministic facts as strictly authoritative. Do NOT contradict",
+        "or invent alternative values for these fields.",
+        "",
+    ]
+
+    if parser_facts:
+        if "subjects" in parser_facts:
+            facts_lines.append(f"subjects: {json.dumps(parser_facts['subjects'])}")
+        if "main_verbs" in parser_facts:
+            facts_lines.append(f"main_verbs: {json.dumps(parser_facts['main_verbs'])}")
+        if "auxiliary_verbs" in parser_facts:
+            facts_lines.append(
+                f"auxiliary_verbs: {json.dumps(parser_facts['auxiliary_verbs'])}"
+            )
+        if "direct_objects" in parser_facts:
+            facts_lines.append(
+                f"direct_objects: {json.dumps(parser_facts['direct_objects'])}"
+            )
+        if "indirect_objects" in parser_facts:
+            facts_lines.append(
+                f"indirect_objects: {json.dumps(parser_facts['indirect_objects'])}"
+            )
+        if "objects_of_prepositions" in parser_facts:
+            facts_lines.append(
+                f"objects_of_prepositions: {json.dumps(parser_facts['objects_of_prepositions'])}"
+            )
+        if "prepositions" in parser_facts:
+            facts_lines.append(
+                f"prepositions: {json.dumps(parser_facts['prepositions'])}"
+            )
+        if "determiners" in parser_facts:
+            facts_lines.append(
+                f"determiners: {json.dumps(parser_facts['determiners'])}"
+            )
+        if "nouns" in parser_facts:
+            facts_lines.append(f"nouns: {json.dumps(parser_facts['nouns'])}")
+        if "pronouns" in parser_facts:
+            facts_lines.append(f"pronouns: {json.dumps(parser_facts['pronouns'])}")
+        if "adjectives" in parser_facts:
+            facts_lines.append(
+                f"adjectives: {json.dumps(parser_facts['adjectives'])}"
+            )
+        if "adverbs" in parser_facts:
+            facts_lines.append(f"adverbs: {json.dumps(parser_facts['adverbs'])}")
+        if "conjunctions" in parser_facts:
+            facts_lines.append(
+                f"conjunctions: {json.dumps(parser_facts['conjunctions'])}"
+            )
+
+    if grammar_facts:
+        if grammar_facts.get("tense"):
+            facts_lines.append(f"tense: \"{grammar_facts['tense']}\"")
+        if grammar_facts.get("voice"):
+            facts_lines.append(f"voice: \"{grammar_facts['voice']}\"")
+        if grammar_facts.get("conditional_type"):
+            facts_lines.append(
+                f"conditional_type: \"{grammar_facts['conditional_type']}\""
+            )
+        if grammar_facts.get("clause_constructions"):
+            facts_lines.append(
+                f"clause_constructions: {json.dumps(grammar_facts['clause_constructions'])}"
+            )
+
+    facts_lines.append(
+        "\nLLM RESPONSIBILITIES:\n"
+        "- Do NOT contradict authoritative non-null deterministic facts above.\n"
+        "- Use these facts to build accurate explanations, phrases, clauses, structure, and Bangla translations.\n"
+        "- You are primarily responsible for: natural Bangla translation, sentence_type, sentence_purpose, phrases, clauses, structure, grammar_explanations, common_mistakes, and natural_alternatives.\n"
+    )
+    return "\n".join(facts_lines)
+
+
+def build_sentence_analysis_prompt(
+    sentence: str,
+    parser_facts: Optional[dict[str, Any]] = None,
+    grammar_facts: Optional[dict[str, Any]] = None,
+) -> str:
     """Build a comprehensive, structured prompt for pedagogical English sentence analysis
-    tailored for Bengali-speaking English learners with strict grammar-quality rules.
+    tailored for Bengali-speaking English learners with strict grammar-quality rules
+    and authoritative deterministic grammar facts.
     """
     cleaned_sentence = sentence.strip()
+    deterministic_block = _format_deterministic_context(parser_facts, grammar_facts)
 
     return f"""You are an elite English grammar, syntax, and linguistics expert teaching Bengali-speaking learners.
 
 Your task is to conduct an in-depth, pedagogically rich, and linguistically precise grammatical analysis of the following English sentence:
 "{cleaned_sentence}"
 
+{deterministic_block}
 =============================================================================
 STRICT CONTENT QUALITY & GRAMMAR ACCURACY RULES
 =============================================================================
